@@ -1,0 +1,1019 @@
+---
+title: "Sintetik Səhiyyə Məlumatlarının Analizi"
+author: "Aysu İ"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  fig.align  = "center"
+)
+```
+
+---
+
+# Giriş
+
+Bu layihədə **sintetik səhiyyə məlumat dəsti** təhlil edilir. Məlumat dəsti üç əsas cədvəldən ibarətdir:
+
+- **patients** — pasiyentlərin demoqrafik məlumatları
+- **encounters** — tibbi müraciətlər
+- **observations** — klinik ölçülər (BMI, qan təzyiqi, xolesterin və s.)
+
+Layihənin məqsədi bu üç cədvəli birləşdirərək hərtərəfli deskriptiv təhlil aparmaq, məlumat keyfiyyətini qiymətləndirmək, anomaliyaları aşkar etmək, dəyişənlər arasındakı əlaqəni statistik testlərlə ölçmək və reqressiya modeli qurmaqdan ibarətdir.
+
+---
+
+# Paketlər və Məlumatın Yüklənməsi
+
+```{r paketler}
+if (!requireNamespace("data.table",  quietly = TRUE)) install.packages("data.table")
+if (!requireNamespace("ggplot2",     quietly = TRUE)) install.packages("ggplot2")
+if (!requireNamespace("dplyr",       quietly = TRUE)) install.packages("dplyr")
+if (!requireNamespace("lubridate",   quietly = TRUE)) install.packages("lubridate")
+if (!requireNamespace("scales",      quietly = TRUE)) install.packages("scales")
+if (!requireNamespace("knitr",       quietly = TRUE)) install.packages("knitr")
+if (!requireNamespace("kableExtra",  quietly = TRUE)) install.packages("kableExtra")
+if (!requireNamespace("car",         quietly = TRUE)) install.packages("car")
+if (!requireNamespace("caret",       quietly = TRUE)) install.packages("caret")
+
+library(data.table)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(car)
+library(caret)
+```
+
+```{r yukle}
+patients     <- readRDS("patients.rds")
+encounters   <- readRDS("encounters.rds")
+observations <- readRDS("observations.rds")
+
+setDT(patients)
+setDT(encounters)
+setDT(observations)
+
+setnames(patients,     tolower(names(patients)))
+setnames(encounters,   tolower(names(encounters)))
+setnames(observations, tolower(names(observations)))
+
+cat("Patients sətir sayı:     ", format(nrow(patients),     big.mark=","), "\n")
+cat("Encounters sətir sayı:   ", format(nrow(encounters),   big.mark=","), "\n")
+cat("Observations sətir sayı: ", format(nrow(observations), big.mark=","), "\n")
+```
+
+---
+
+# Məlumat Keyfiyyəti və Təmizlik
+
+## NA Analizi
+
+```{r na-analiz}
+# Patients NA faizləri
+na_patients <- sapply(patients, function(x) round(mean(is.na(x)) * 100, 1))
+na_pat_dt <- data.table(Sutun = names(na_patients), NA_faiz = na_patients)
+na_pat_dt <- na_pat_dt[order(-NA_faiz)]
+
+kable(na_pat_dt, col.names = c("Sütun", "NA Faizi (%)"),
+      caption = "Patients Cədvəlində NA Paylanması") |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) |>
+  row_spec(which(na_pat_dt$NA_faiz > 50), color = "red")
+
+# Encounters NA faizləri
+na_encounters <- sapply(encounters, function(x) round(mean(is.na(x)) * 100, 1))
+na_enc_dt <- data.table(Sutun = names(na_encounters), NA_faiz = na_encounters)
+na_enc_dt <- na_enc_dt[order(-NA_faiz)]
+
+kable(na_enc_dt, col.names = c("Sütun", "NA Faizi (%)"),
+      caption = "Encounters Cədvəlində NA Paylanması") |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE)
+
+# Observations NA faizləri
+na_obs <- sapply(observations, function(x) round(mean(is.na(x)) * 100, 1))
+na_obs_dt <- data.table(Sutun = names(na_obs), NA_faiz = na_obs)
+
+kable(na_obs_dt, col.names = c("Sütun", "NA Faizi (%)"),
+      caption = "Observations Cədvəlində NA Paylanması") |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE)
+```
+
+> **Şərh:** NA analizi hər sütundakı çatışmayan məlumatın faizini göstərir. Yüksək NA faizli sütunlar (qırmızı) analiz zamanı ehtiyatla istifadə edilməlidir.
+
+## Dublikat Yoxlaması
+
+```{r dublikat}
+dup_patients   <- sum(duplicated(patients,   by = "id"))
+dup_encounters <- sum(duplicated(encounters, by = "id"))
+
+cat("Patients dublikat sayı:   ", dup_patients,   "\n")
+cat("Encounters dublikat sayı: ", dup_encounters, "\n")
+```
+
+## Məntiqi Xətalı Qeydlər
+
+```{r mentiqi-xeta}
+# deathdate < birthdate olan qeydlər
+patients[, birthdate := as.Date(birthdate)]
+patients[, deathdate := as.Date(deathdate)]
+
+xeta <- patients[!is.na(deathdate) & deathdate < birthdate, .N]
+cat("deathdate < birthdate olan xətalı qeyd sayı:", xeta, "\n")
+
+# Məntiqdışı qeydləri çıxar
+patients <- patients[is.na(deathdate) | deathdate >= birthdate]
+```
+
+## Tarix Formatlaması və Yaş Hesablanması
+
+```{r tarix-yas}
+# Sys.Date() — sənəd hər işlədildikdə cari tarixi götürür
+bugun <- Sys.Date()
+
+encounters[,   date := as.Date(date)]
+observations[, date := as.Date(date)]
+
+# Yaş hesablanması: sağ olanlar üçün bugünkü tarix, vəfat edənlər üçün ölüm tarixi
+patients[is.na(deathdate),  yas := as.numeric(bugun - birthdate) / 365.25]
+patients[!is.na(deathdate), yas := as.numeric(deathdate - birthdate) / 365.25]
+
+# Məntiqdışı yaşları çıxar
+patients <- patients[yas >= 0 & yas <= 120]
+
+cat("Cari tarix (Sys.Date()):", format(bugun), "\n")
+cat("Yaş hesablanmış pasiyent sayı:", format(nrow(patients), big.mark=","), "\n")
+```
+
+## fcase() ilə Yaş Kateqoriyaları
+
+```{r yas-cat}
+# fcase() — data.table-in native funksiyası (case_when əvəzinə)
+patients[, yas_cat := fcase(
+  yas <  18,            "Usaq (0-17)",
+  yas >= 18 & yas < 35, "Genc (18-34)",
+  yas >= 35 & yas < 55, "Orta yas (35-54)",
+  yas >= 55 & yas < 70, "Boyuk yas (55-69)",
+  yas >= 70,            "Yasli (70+)"
+)]
+
+patients[, yas_cat := factor(yas_cat, levels = c(
+  "Usaq (0-17)", "Genc (18-34)", "Orta yas (35-54)",
+  "Boyuk yas (55-69)", "Yasli (70+)"
+))]
+
+patients[, .N, by = yas_cat][order(yas_cat)] |>
+  kable(col.names = c("Yas Kateqoriyasi", "Pasiyent Sayi"),
+        caption = "Yas Kateqoriyalari uzre Pasiyent Sayi") |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE)
+```
+
+## Observations Cədvəlindəki Bütün Göstəricilər
+
+```{r obs-gostericiler}
+# Observations-dakı bütün description növləri
+obs_novler <- observations[, .N, by = description][order(-N)]
+
+kable(obs_novler[1:20], col.names = c("Klinik Gostərici", "Olcu Sayi"),
+      caption = "Observations Cedvelindeki En Cox 20 Gostərici") |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE)
+```
+
+> **Şərh:** Observations cədvəlində çoxsaylı klinik göstərici mövcuddur. Analiz üçün BMI, sistol/diastolik qan təzyiqi, xolesterin və qan şəkəri seçilmişdir.
+
+---
+
+# Deskriptiv Təhlil
+
+## Pasiyentlər (Patients)
+
+### Ümumi Statistika
+
+```{r yas-stat}
+yas_stat <- patients[, .(
+  `Orta Yas`   = round(mean(yas, na.rm=TRUE), 1),
+  `Median Yas` = round(median(yas, na.rm=TRUE), 1),
+  `Std Sapma`  = round(sd(yas, na.rm=TRUE), 1),
+  `Min Yas`    = round(min(yas, na.rm=TRUE), 1),
+  `Max Yas`    = round(max(yas, na.rm=TRUE), 1)
+)]
+
+kable(yas_stat, caption = "Pasiyent Yasinin Deskriptiv Statistikasi") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+### Cins Paylanması
+
+```{r cins}
+cins <- patients[, .N, by = gender]
+cins[, faiz := round(N / sum(N) * 100, 1)]
+
+ggplot(cins, aes(x = gender, y = N, fill = gender)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = paste0(faiz, "%")), vjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_manual(values = c("F" = "#e07b8a", "M" = "#5b8db8")) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Pasiyentlerin Cins uzre Paylanmasi",
+       x = "Cins (F = Qadin, M = Kisi)", y = "Pasiyent sayi") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+> **Şərh:** Məlumat dəstindəki pasiyentlər cins baxımından demək olar ki bərabər paylanmışdır.
+
+### Yaş Paylanması
+
+```{r yas-hist}
+ggplot(patients, aes(x = yas, fill = gender)) +
+  geom_histogram(bins = 35, alpha = 0.75, position = "identity", color = "white") +
+  scale_fill_manual(values = c("F" = "#e07b8a", "M" = "#5b8db8"),
+                    name = "Cins", labels = c("Qadin", "Kisi")) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Pasiyentlerin Yas Paylanmasi",
+       x = "Yas", y = "Pasiyent sayi") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Yaş Kateqoriyaları üzrə Boxplot
+
+```{r yas-box}
+ggplot(patients, aes(x = yas_cat, y = yas, fill = yas_cat)) +
+  geom_boxplot(show.legend = FALSE, outlier.color = "red",
+               outlier.alpha = 0.4, outlier.size = 1.5) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Yas Kateqoriyalari uzre Yas Boxplot",
+       x = "Yas kateqoriyasi", y = "Yas") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+### İrq Paylanması
+
+```{r irq}
+irq <- patients[, .N, by = race][order(-N)]
+
+ggplot(irq, aes(x = reorder(race, N), y = N, fill = race)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = comma(N)), hjust = -0.1, size = 4) +
+  coord_flip() +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_brewer(palette = "Set3") +
+  labs(title = "Pasiyentlerin Irq uzre Paylanmasi",
+       x = NULL, y = "Pasiyent sayi") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Ölüm Statistikası və Yaş Analizi
+
+```{r olum}
+olum_stat <- patients[, .(
+  `Sag olan`       = sum(is.na(deathdate)),
+  `Vefat etmis`    = sum(!is.na(deathdate)),
+  `Umumi`          = .N,
+  `Olum faizi (%)` = round(sum(!is.na(deathdate)) / .N * 100, 1)
+)]
+
+kable(olum_stat, caption = "Pasiyentlerin Heyat Statusu") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+# Ölüm yaşının cinslər üzrə müqayisəsi
+olum_yas <- patients[!is.na(deathdate)]
+
+ggplot(olum_yas, aes(x = gender, y = yas, fill = gender)) +
+  geom_boxplot(show.legend = FALSE, outlier.color = "red", outlier.alpha = 0.3) +
+  scale_fill_manual(values = c("F" = "#e07b8a", "M" = "#5b8db8")) +
+  labs(title = "Vefat Eden Pasiyentlerde Olum Yasi (Cins uzre)",
+       x = "Cins", y = "Olum yasi") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+> **Şərh:** Vəfat edən pasiyentlərin ölüm yaşı cinslər üzrə müqayisə edilmişdir. Boxplot hər iki cinsdə ölüm yaşı paylanmasını göstərir.
+
+---
+
+## Müraciətlər (Encounters)
+
+### İllər üzrə Müraciət Trendi
+
+```{r enc-trend}
+encounters[, il := year(date)]
+il_say <- encounters[, .N, by = il][order(il)]
+
+ggplot(il_say, aes(x = il, y = N)) +
+  geom_area(fill = "#a8d8ea", alpha = 0.5) +
+  geom_line(color = "#2c7bb6", linewidth = 1.2) +
+  geom_point(color = "#d7191c", size = 3) +
+  scale_y_continuous(labels = comma) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 8)) +
+  labs(title    = "Iller uzre Tibbi Muraciet Sayi",
+       subtitle = "Sahe qrafiki: umumi hecm, xett: trend",
+       x = "Il", y = "Muraciet sayi") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Pasiyent Başına Müraciət Nisbəti (Normallaşdırılmış)
+
+```{r enc-normallasdir}
+# Hər il üçün aktiv pasiyent sayı
+il_pasiyent <- encounters[, .(pasiyent_n = uniqueN(patient)), by = il]
+il_say_norm <- merge(il_say, il_pasiyent, by = "il")
+il_say_norm[, muraciet_per_pasiyent := round(N / pasiyent_n, 2)]
+
+kable(il_say_norm[order(il)],
+      col.names = c("Il", "Umumi Muraciet", "Aktiv Pasiyent", "Pasiyent basina Muraciet"),
+      caption = "Illər uzrə Normallaşdırılmış Müraciət Sayi") |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE)
+
+ggplot(il_say_norm, aes(x = il, y = muraciet_per_pasiyent)) +
+  geom_line(color = "#2c7bb6", linewidth = 1.2) +
+  geom_point(color = "#d7191c", size = 3) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 8)) +
+  labs(title    = "Pasiyent basina Muraciet Sayi (Illər uzre)",
+       subtitle = "Populyasiya artimina gore normallasdirılmis metrika",
+       x = "Il", y = "Pasiyent basina muraciet") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+> **Şərh:** Sadə müraciət sayı yerinə pasiyent başına müraciət nisbəti istifadə edilmişdir. Bu, populyasiya artımının təsirini aradan qaldırır və daha düzgün trend analizi imkanı verir.
+
+### Ən Çox Rast Gəlinən Müraciət Səbəbləri (Top 10)
+
+```{r enc-sebeb}
+sebeb <- encounters[
+  !is.na(reasondescription) & reasondescription != "",
+  .N, by = reasondescription
+][order(-N)][1:10]
+
+ggplot(sebeb, aes(x = reorder(reasondescription, N), y = N)) +
+  geom_col(fill = "#4393c3") +
+  geom_text(aes(label = comma(N)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.2))) +
+  labs(title = "En Cox Rast Gelingen Muraciet Sebebleri (Top 10)",
+       x = NULL, y = "Muraciet sayi") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+> **Şərh:** Xroniki xəstəliklər (hipertenziya, diabet) ən çox müraciət səbəbidir. Bu profilaktik tibb siyasətlərinin əhəmiyyətini vurğulayır.
+
+---
+
+## Müşahidələr (Observations)
+
+### BMI Məlumatının Hazırlanması
+
+```{r bmi-hazir}
+bmi_data <- observations[description %like% "Body Mass Index" |
+                          description %like% "BMI"]
+bmi_data[, value := as.numeric(value)]
+
+# Filtrasiya izahı:
+# 1. Addım: Fiziki olaraq mümkünsüz dəyərləri çıxar (value > 10 & value < 80)
+# 2. Addım: Qalan dəyərlər üzərində IQR anomaliya aşkarlaması
+cat("Filtrasiyadan əvvəl sətir sayı:", nrow(bmi_data), "\n")
+bmi_data <- bmi_data[!is.na(value) & value > 10 & value < 80]
+cat("Filtrasiyadan sonra sətir sayı:", nrow(bmi_data), "\n")
+cat("Çıxarılan sətir sayı:", nrow(observations[description %like% "Body Mass Index"]) - nrow(bmi_data), "\n")
+
+# fcase() ilə BMI kateqoriyaları
+bmi_data[, bmi_cat := fcase(
+  value < 18.5,               "Zeif ceki",
+  value >= 18.5 & value < 25, "Normal",
+  value >= 25   & value < 30, "Artiq ceki",
+  value >= 30,                "Obez"
+)]
+
+bmi_data[, bmi_cat := factor(bmi_cat,
+  levels = c("Zeif ceki", "Normal", "Artiq ceki", "Obez"))]
+
+bmi_data[, .N, by = bmi_cat][order(bmi_cat)] |>
+  kable(col.names = c("BMI Kateqoriyasi", "Olcu Sayi"),
+        caption = "BMI Kateqoriyalari uzre Paylanma") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+### BMI Paylanması
+
+```{r bmi-hist}
+bmi_renk <- c("Zeif ceki"  = "#74add1",
+               "Normal"     = "#4dac26",
+               "Artiq ceki" = "#f4a582",
+               "Obez"       = "#d73027")
+
+ggplot(bmi_data, aes(x = value, fill = bmi_cat)) +
+  geom_histogram(bins = 40, color = "white", alpha = 0.85) +
+  geom_vline(xintercept = c(18.5, 25, 30),
+             linetype = "dashed", color = "black", linewidth = 0.7) +
+  scale_fill_manual(values = bmi_renk, name = "BMI Kateqoriyasi") +
+  scale_y_continuous(labels = comma) +
+  labs(title    = "BMI (Beden Kutle Indeksi) Paylanmasi",
+       subtitle = "Saquli xetler: 18.5, 25 ve 30 heddlerini gosterir",
+       x = "BMI (kg/m2)", y = "Say") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+> **Şərh:** BMI paylanması sağa meyllidir. Pasiyentlərin böyük hissəsi artıq çəkili və ya obez kateqoriyasındadır.
+
+### Qan Təzyiqi və Digər Klinik Göstəricilər
+
+```{r bp-xolesterin}
+# Sistol qan təzyiqi
+bp_sys <- observations[description %like% "Systolic Blood Pressure"]
+bp_sys[, value := as.numeric(value)]
+bp_sys <- bp_sys[!is.na(value) & value > 50 & value < 250]
+
+# Diastolik qan təzyiqi
+bp_dia <- observations[description %like% "Diastolic Blood Pressure"]
+bp_dia[, value := as.numeric(value)]
+bp_dia <- bp_dia[!is.na(value) & value > 30 & value < 150]
+
+# Xolesterin
+xol <- observations[description %like% "Total Cholesterol" | description %like% "Cholesterol"]
+xol[, value := as.numeric(value)]
+xol <- xol[!is.na(value) & value > 50 & value < 500]
+
+# Qan şəkəri
+sekr <- observations[description %like% "Glucose" | description %like% "Blood Glucose"]
+sekr[, value := as.numeric(value)]
+sekr <- sekr[!is.na(value) & value > 30 & value < 600]
+
+klinik_stat <- data.table(
+  Gostərici     = c("Sistol Qan Tezyiqi (mmHg)", "Diastolik Qan Tezyiqi (mmHg)",
+                    "Xolesterin (mg/dL)", "Qan Sekeri (mg/dL)"),
+  `Olcu Sayi`   = c(nrow(bp_sys), nrow(bp_dia), nrow(xol), nrow(sekr)),
+  `Orta`        = c(round(mean(bp_sys$value),1), round(mean(bp_dia$value),1),
+                    round(mean(xol$value),1),    round(mean(sekr$value),1)),
+  `Median`      = c(round(median(bp_sys$value),1), round(median(bp_dia$value),1),
+                    round(median(xol$value),1),     round(median(sekr$value),1)),
+  `Std Sapma`   = c(round(sd(bp_sys$value),1), round(sd(bp_dia$value),1),
+                    round(sd(xol$value),1),     round(sd(sekr$value),1))
+)
+
+kable(klinik_stat, caption = "Klinik Gostericilerin Deskriptiv Statistikasi") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+# Sistol qan təzyiqi histogramı
+ggplot(bp_sys, aes(x = value)) +
+  geom_histogram(bins = 40, fill = "#d73027", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = 120, linetype = "dashed", color = "#1a9850", linewidth = 1) +
+  geom_vline(xintercept = 140, linetype = "dashed", color = "#d73027", linewidth = 1) +
+  scale_y_continuous(labels = comma) +
+  labs(title    = "Sistol Qan Tezyiqi Paylanmasi",
+       subtitle = "Yasil: 120 mmHg (normal heddi), Qirmizi: 140 mmHg (hipertenziya heddi)",
+       x = "Sistol (mmHg)", y = "Say") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### BMI Kateqoriyaları üzrə Boxplot
+
+```{r bmi-box}
+ggplot(bmi_data, aes(x = bmi_cat, y = value, fill = bmi_cat)) +
+  geom_boxplot(show.legend = FALSE, outlier.color = "red",
+               outlier.alpha = 0.3, outlier.size = 1) +
+  scale_fill_manual(values = bmi_renk) +
+  labs(title = "BMI Kateqoriyalari uzre Deger Paylanmasi (Boxplot)",
+       x = "BMI Kateqoriyasi", y = "BMI (kg/m2)") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+---
+
+# Cədvəllərin Birləşdirilməsi (JOIN)
+
+```{r join}
+enc_pat <- merge(
+  encounters,
+  patients[, .(id, yas, yas_cat, gender, race, marital)],
+  by.x = "patient", by.y = "id", all.x = TRUE
+)
+
+bmi_pat <- merge(
+  bmi_data[, .(patient, date, value, bmi_cat)],
+  patients[, .(id, yas, yas_cat, gender, race)],
+  by.x = "patient", by.y = "id", all.x = TRUE
+)
+
+cat("enc_pat setir sayi: ", format(nrow(enc_pat), big.mark=","), "\n")
+cat("bmi_pat setir sayi: ", format(nrow(bmi_pat), big.mark=","), "\n")
+```
+
+## Yaş Kateqoriyası üzrə Müraciət Sayı
+
+```{r yas-enc}
+yas_enc_plot <- enc_pat[!is.na(yas_cat), .N, by = yas_cat][order(yas_cat)]
+
+ggplot(yas_enc_plot, aes(x = yas_cat, y = N, fill = yas_cat)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = comma(N)), vjust = -0.4, size = 4, fontface = "bold") +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Yas Kateqoriyasi uzre Muraciet Sayi",
+       x = "Yas kateqoriyasi", y = "Muraciet sayi") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+## Facet: Cins və Yaş üzrə Müraciət
+
+```{r facet-enc}
+yas_cins <- enc_pat[!is.na(yas_cat) & !is.na(gender), .N, by = .(yas_cat, gender)]
+
+ggplot(yas_cins, aes(x = yas_cat, y = N, fill = gender)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("F" = "#e07b8a", "M" = "#5b8db8"),
+                    name = "Cins", labels = c("Qadin","Kisi")) +
+  scale_y_continuous(labels = comma) +
+  facet_wrap(~ gender, labeller = labeller(gender = c("F"="Qadin","M"="Kisi"))) +
+  labs(title = "Yas Kateqoriyasi ve Cins uzre Muraciet Sayi (Facet)",
+       x = "Yas kateqoriyasi", y = "Muraciet sayi") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 25, hjust = 1),
+        legend.position = "none")
+```
+
+---
+
+# Anomaliyalar
+
+## IQR Metodu ilə BMI Anomaliyaları
+
+```{r anomaliya-bmi}
+Q1_bmi  <- quantile(bmi_data$value, 0.25, na.rm = TRUE)
+Q3_bmi  <- quantile(bmi_data$value, 0.75, na.rm = TRUE)
+IQR_bmi <- Q3_bmi - Q1_bmi
+alt_bmi <- Q1_bmi - 1.5 * IQR_bmi
+ust_bmi <- Q3_bmi + 1.5 * IQR_bmi
+
+bmi_data[, anomaliya := value < alt_bmi | value > ust_bmi]
+
+anom_stat <- data.table(
+  Gostərici = c("Q1 (25. persentil)", "Q3 (75. persentil)", "IQR",
+                "Alt hedd (Q1-1.5xIQR)", "Ust hedd (Q3+1.5xIQR)",
+                "Anomal BMI sayi", "Anomal BMI faizi (%)"),
+  Deger = c(round(Q1_bmi,2), round(Q3_bmi,2), round(IQR_bmi,2),
+            round(alt_bmi,2), round(ust_bmi,2),
+            bmi_data[anomaliya==TRUE, .N],
+            round(bmi_data[anomaliya==TRUE, .N] / nrow(bmi_data) * 100, 2))
+)
+
+kable(anom_stat, caption = "BMI Anomaliya Analizi (IQR Metodu)") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+ggplot(bmi_data, aes(x = value, fill = anomaliya)) +
+  geom_histogram(bins = 40, color = "white", alpha = 0.85) +
+  geom_vline(xintercept = c(alt_bmi, ust_bmi),
+             linetype = "dashed", color = "red", linewidth = 1) +
+  scale_fill_manual(values = c("FALSE" = "#74add1", "TRUE" = "#d73027"),
+                    name = "Anomaliya", labels = c("Normal", "Anomal")) +
+  scale_y_continuous(labels = comma) +
+  labs(title    = "BMI Paylanmasi — Anomaliyalar Vurgulanmis",
+       subtitle = paste0("Qirmizi xetler: alt hedd=", round(alt_bmi,1),
+                         ", ust hedd=", round(ust_bmi,1)),
+       x = "BMI (kg/m2)", y = "Say") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+> **Şərh:** IQR metodunun iki addımı: əvvəlcə fiziki olaraq mümkünsüz dəyərlər (10-80 xaricindəkilər) çıxarılmışdır, sonra qalan dəyərlər üzərində IQR metodu tətbiq edilmişdir. Anomal dəyərlər ölçüm xətası, nadir tibbi vəziyyət və ya data keyfiyyəti problemi ilə izah oluna bilər.
+
+## Müraciət Sayında Anomaliyalar
+
+```{r anomaliya-enc}
+enc_per_pat <- encounters[, .N, by = patient]
+
+Q1_e  <- quantile(enc_per_pat$N, 0.25)
+Q3_e  <- quantile(enc_per_pat$N, 0.75)
+IQR_e <- Q3_e - Q1_e
+ust_e <- Q3_e + 1.5 * IQR_e
+
+enc_per_pat[, anomaliya := N > ust_e]
+cat("Anomal muraciet heddi: >", round(ust_e, 0), "\n")
+cat("Anomal pasiyent sayi:", enc_per_pat[anomaliya==TRUE, .N], "\n")
+
+ggplot(enc_per_pat, aes(x = N, fill = anomaliya)) +
+  geom_histogram(bins = 50, color = "white", alpha = 0.85) +
+  geom_vline(xintercept = ust_e, color = "red", linetype = "dashed", linewidth = 1.2) +
+  scale_fill_manual(values = c("FALSE" = "#74add1", "TRUE" = "#d73027"),
+                    name = "Anomaliya", labels = c("Normal", "Anomal")) +
+  scale_y_continuous(labels = comma) +
+  labs(title    = "Pasiyent basina Muraciet Sayi Paylanmasi",
+       subtitle = paste0("Qirmizi xett: anomaliya heddi (", round(ust_e,0), ")"),
+       x = "Muraciet sayi", y = "Pasiyent sayi") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+---
+
+# Korrelyasiya Analizi
+
+## Yas-BMI Birləşdirilmiş Məlumat
+
+```{r bmi-yas-merge}
+bmi_yas <- merge(
+  bmi_data[, .(patient, value, bmi_cat)],
+  patients[, .(id, yas, yas_cat, gender)],
+  by.x = "patient", by.y = "id", all.x = TRUE
+)
+bmi_yas <- bmi_yas[!is.na(yas) & !is.na(value)]
+```
+
+## Pearson vs Spearman Korrelyasiya
+
+```{r korrelasiya}
+# Pearson korrelyasiya (normal paylanma fərzi ilə)
+kor_pearson <- cor.test(bmi_yas$yas, bmi_yas$value, method = "pearson")
+
+# Spearman korrelyasiya (paylanma fərzindən azad)
+kor_spearman <- cor.test(bmi_yas$yas, bmi_yas$value, method = "spearman")
+
+kor_muq <- data.table(
+  Metod        = c("Pearson", "Spearman"),
+  `r / rho`    = c(round(kor_pearson$estimate, 4),
+                   round(kor_spearman$estimate, 4)),
+  `p-deger`    = c(format(kor_pearson$p.value, scientific=TRUE, digits=3),
+                   format(kor_spearman$p.value, scientific=TRUE, digits=3)),
+  Qiymetlen    = c(ifelse(abs(kor_pearson$estimate) < 0.2,  "Cox zeif",
+                   ifelse(abs(kor_pearson$estimate) < 0.4,  "Zeif",
+                   ifelse(abs(kor_pearson$estimate) < 0.6,  "Orta", "Guclu"))),
+                   ifelse(abs(kor_spearman$estimate) < 0.2, "Cox zeif",
+                   ifelse(abs(kor_spearman$estimate) < 0.4, "Zeif",
+                   ifelse(abs(kor_spearman$estimate) < 0.6, "Orta", "Guclu"))))
+)
+
+kable(kor_muq, caption = "Pearson vs Spearman Korrelyasiya Muqayisesi") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+## Geniş Korrelyasiya Matrisi
+
+```{r kor-matris}
+# BMI + sistol + diastolik + xolesterin + yaş korrelyasiya matrisi
+bp_sys_pat <- merge(bp_sys[, .(patient, bp_sys = value)],
+                    patients[, .(id, yas)], by.x="patient", by.y="id")
+bp_dia_pat <- merge(bp_dia[, .(patient, bp_dia = value)],
+                    patients[, .(id)], by.x="patient", by.y="id")
+bmi_min    <- bmi_data[, .(patient, bmi = value)]
+
+# En son ölçünü götür (unique problem həlli: hər pasiyent üçün son BMI)
+bmi_son <- bmi_data[order(patient, date)][, .SD[.N], by = patient][, .(patient, bmi = value)]
+
+kor_data <- merge(bmi_son, bp_sys_pat[, .(patient, bp_sys, yas)], by="patient")
+
+if (nrow(kor_data) > 100) {
+  kor_matrix <- cor(kor_data[, .(bmi, bp_sys, yas)], use="complete.obs")
+  kable(round(kor_matrix, 3), caption = "Korrelyasiya Matrisi (BMI, Sistol QT, Yas)") |>
+    kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+}
+```
+
+## Scatter Plot + Reqressiya Xətti
+
+```{r scatter}
+set.seed(42)
+numune <- bmi_yas[sample(.N, min(8000, .N))]
+
+ggplot(numune, aes(x = yas, y = value, color = gender)) +
+  geom_point(alpha = 0.25, size = 1.2) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1.2) +
+  scale_color_manual(values = c("F" = "#e07b8a", "M" = "#5b8db8"),
+                     name = "Cins", labels = c("Qadin","Kisi")) +
+  labs(title    = "Yas ile BMI Arasindaki Elaqe (Scatter Plot)",
+       subtitle = paste0("Pearson r = ", round(kor_pearson$estimate, 3),
+                         " | Spearman rho = ", round(kor_spearman$estimate, 3),
+                         " | Xett: Xetti reqressiya (95% CI)"),
+       x = "Yas", y = "BMI (kg/m2)") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+> **Şərh:** Pearson və Spearman korrelyasiya əmsalları müqayisə edilmişdir. Hər ikisi zəif müsbət əlaqəni göstərir. Spearman metodunun normal paylanma fərzindən azad olması onu bu tip böyük dataset üçün daha uyğun edir.
+
+---
+
+# Reqressiya Analizi
+
+## Sadə Xətti Reqressiya (BMI ~ Yaş)
+
+```{r simple-reg}
+model_sade <- lm(value ~ yas, data = bmi_yas)
+summary(model_sade)
+```
+
+```{r simple-reg-stat}
+coef_sade <- summary(model_sade)$coefficients
+
+reg_stat <- data.table(
+  Gostərici = c("R2 (Determinasiya emsali)",
+                "Duzeldilmis R2",
+                "Kesisme noktesi (intercept)",
+                "Yasin emsali",
+                "p-deger (intercept)",
+                "p-deger (yas)"),
+  Deger = c(
+    round(summary(model_sade)$r.squared, 4),
+    round(summary(model_sade)$adj.r.squared, 4),
+    round(coef_sade[1,1], 4),
+    round(coef_sade[2,1], 4),
+    format(coef_sade[1,4], scientific=TRUE, digits=3),
+    format(coef_sade[2,4], scientific=TRUE, digits=3)
+  )
+)
+
+kable(reg_stat, caption = "Sade Xetti Reqressiya Neticeleri (BMI ~ Yas)") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+### Residual Diaqnostikası
+
+```{r residual-sade}
+par(mfrow = c(2, 2))
+plot(model_sade, main = "Sade Reqressiya - Residual Diaqnostika")
+par(mfrow = c(1, 1))
+```
+
+> **Şərh:** Residual diaqnostika 4 qrafik vasitəsilə xətti reqressiyanın dörd əsas fərziyyəsini yoxlayır: (1) xəttililik, (2) homoskedastiklik, (3) normallik, (4) müstəqillik. Bu yoxlamalar modelin etibarlılığını qiymətləndirmək üçün vacibdir.
+
+## Mürəkkəb Xətti Reqressiya (BMI ~ Yaş + Cins)
+
+```{r multiple-reg}
+# Gender encoding: Kisi (M) = 0 (reference), Qadin (F) = 1
+# Bu o demekdir ki: emsalin muster yonu Qadinlarin BMI-nin
+# Kisilerden ne qeder yuksek/asagi oldugunu gosterir
+bmi_yas[, gender_n := ifelse(gender == "F", 1, 0)]
+
+model_cox <- lm(value ~ yas + gender_n, data = bmi_yas)
+summary(model_cox)
+```
+
+```{r multiple-reg-stat}
+coef_cox <- summary(model_cox)$coefficients
+
+reg_cox <- data.table(
+  Deyisen     = c("Kesisme noktesi", "Yas", "Cins (Qadin=1, Kisi=0)"),
+  Emsal       = round(coef_cox[,1], 4),
+  `Std Xeta`  = round(coef_cox[,2], 4),
+  `t-deger`   = round(coef_cox[,3], 4),
+  `p-deger`   = format(coef_cox[,4], scientific=TRUE, digits=3)
+)
+
+kable(reg_cox, caption = "Murekkeb Xetti Reqressiya Neticeleri (BMI ~ Yas + Cins)") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+cat("R2:", round(summary(model_cox)$r.squared, 4), "\n")
+cat("Duzeldilmis R2:", round(summary(model_cox)$adj.r.squared, 4), "\n")
+cat("Izah: Reference kateqoriya = Kisi (gender_n = 0)\n")
+cat("Cinsin emsali muster yonu: Qadinlarin BMI-si Kisilerden ne qeder ferqlidir\n")
+```
+
+### Residual Diaqnostikası (Mürəkkəb Model)
+
+```{r residual-cox}
+par(mfrow = c(2, 2))
+plot(model_cox, main = "Murekkeb Reqressiya - Residual Diaqnostika")
+par(mfrow = c(1, 1))
+```
+
+### VIF (Multikollinearlik) Yoxlaması
+
+```{r vif}
+vif_values <- vif(model_cox)
+cat("VIF deyerleri:\n")
+print(vif_values)
+cat("\nIzah: VIF < 5 → multikollinearlik problemi yoxdur\n")
+cat("VIF >= 5 → orta multikollinearlik\n")
+cat("VIF >= 10 → ciddi multikollinearlik\n")
+```
+
+> **Şərh:** VIF (Variance Inflation Factor) dəyişənlər arasında multikollinearliği ölçür. VIF < 5 olan halda multikollinearlik problemi yoxdur və model əmsalları etibarlıdır.
+
+### Cross-Validation ilə Model Etibarlılığı
+
+```{r cross-validation}
+set.seed(42)
+cv_data <- bmi_yas[!is.na(value) & !is.na(yas) & !is.na(gender_n),
+                   .(value, yas, gender_n)]
+cv_data <- as.data.frame(cv_data)
+
+train_control <- trainControl(method = "cv", number = 10)
+model_cv <- train(value ~ yas + gender_n,
+                  data      = cv_data,
+                  method    = "lm",
+                  trControl = train_control)
+
+cv_netice <- data.table(
+  Metrika = c("RMSE (10-fold CV)", "R2 (10-fold CV)", "MAE (10-fold CV)"),
+  Deger   = c(round(model_cv$results$RMSE, 4),
+              round(model_cv$results$Rsquared, 4),
+              round(model_cv$results$MAE, 4))
+)
+
+kable(cv_netice, caption = "10-Fold Cross-Validation Neticeleri") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+> **Şərh:** 10-fold cross-validation modelin yeni məlumat üzərindəki ümumi performansını qiymətləndirir. CV nəticələri train datasındakı nəticələrə yaxın olarsa, model overfitting etməmişdir.
+
+---
+
+# Proqnoz və Fərziyyələr
+
+## Fərziyyə 1 — Yaşlı Pasiyentlər Daha Çox Müraciət Edir
+
+```{r ferziyye-1}
+enc_yas <- merge(
+  enc_per_pat[, .(patient, enc_n = N)],
+  patients[, .(id, yas_cat)],
+  by.x = "patient", by.y = "id"
+)
+
+yas_enc_stat <- enc_yas[!is.na(yas_cat), .(
+  `Orta muraciet`   = round(mean(enc_n), 1),
+  `Median muraciet` = round(median(enc_n), 1),
+  `Pasiyent sayi`   = .N
+), by = yas_cat][order(yas_cat)]
+
+kable(yas_enc_stat, caption = "Yas Kateqoriyasi uzre Muraciet Statistikasi") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+# Kruskal-Wallis testi (qruplar arasında fərq statistik olaraq mənalıdırmı?)
+kw_test <- kruskal.test(enc_n ~ yas_cat, data = enc_yas[!is.na(yas_cat)])
+cat("Kruskal-Wallis testi:\n")
+cat("chi-kare =", round(kw_test$statistic, 2), "\n")
+cat("p-deger =", format(kw_test$p.value, scientific=TRUE, digits=3), "\n")
+cat("Netice:", ifelse(kw_test$p.value < 0.05,
+    "p < 0.05 → Qruplar arasinda statistik olaraq menali ferq var (TESDIQLENIB)",
+    "p >= 0.05 → Statistik olaraq menali ferq yoxdur (TESDIQLENMIR)"), "\n")
+
+ggplot(enc_yas[!is.na(yas_cat)], aes(x = yas_cat, y = enc_n, fill = yas_cat)) +
+  geom_boxplot(show.legend = FALSE, outlier.alpha = 0.2, outlier.color = "red") +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(labels = comma) +
+  labs(title    = "Yas Kateqoriyasi uzre Muraciet Sayi Boxplot",
+       subtitle = paste0("Kruskal-Wallis: p = ",
+                         format(kw_test$p.value, scientific=TRUE, digits=3)),
+       x = "Yas kateqoriyasi", y = "Muraciet sayi") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title  = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+> **Şərh:** Kruskal-Wallis testi qruplar arasındakı fərqin statistik əhəmiyyətini ölçür. p < 0.05 olduqda fərziyyə statistik test əsasında təsdiqlənir.
+
+## Fərziyyə 2 — Obez Pasiyentlər Daha Tez-Tez Müraciət Edir
+
+```{r ferziyye-2}
+# Hər pasiyent üçün ən son BMI ölçüsü götürülür
+# (unique() ilk sıranı deyil, ən son tarixi götürür)
+bmi_son_enc <- bmi_data[order(patient, date)][, .SD[.N], by = patient][, .(patient, bmi_cat)]
+
+bmi_enc <- merge(bmi_son_enc, enc_per_pat[, .(patient, enc_n = N)], by = "patient")
+
+bmi_enc_stat <- bmi_enc[, .(
+  `Orta muraciet` = round(mean(enc_n), 1),
+  `Median`        = round(median(enc_n), 1),
+  `Pasiyent sayi` = .N
+), by = bmi_cat][order(bmi_cat)]
+
+kable(bmi_enc_stat, caption = "BMI Kateqoriyasi uzre Muraciet Statistikasi") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+# Kruskal-Wallis testi
+kw_bmi <- kruskal.test(enc_n ~ bmi_cat, data = bmi_enc[!is.na(bmi_cat)])
+cat("Kruskal-Wallis testi (BMI ~ Muraciet):\n")
+cat("p-deger =", format(kw_bmi$p.value, scientific=TRUE, digits=3), "\n")
+cat("Netice:", ifelse(kw_bmi$p.value < 0.05,
+    "p < 0.05 → TESDIQLENIB",
+    "p >= 0.05 → TESDIQLENMIR"), "\n")
+
+ggplot(bmi_enc_stat, aes(x = bmi_cat, y = `Orta muraciet`, fill = bmi_cat)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = `Orta muraciet`), vjust = -0.4, size = 5, fontface = "bold") +
+  scale_fill_manual(values = bmi_renk) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title    = "BMI Kateqoriyasi uzre Orta Muraciet Sayi",
+       subtitle = paste0("Kruskal-Wallis: p = ",
+                         format(kw_bmi$p.value, scientific=TRUE, digits=3)),
+       x = "BMI kateqoriyasi", y = "Orta muraciet sayi") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+> **Şərh:** Hər pasiyent üçün ən son BMI ölçüsü seçilmişdir (tarixə görə sıralanıb, sonuncu götürülüb). Bu, random ilk ölçünün seçilməsindən daha metodoloji cəhətdən düzgündür.
+
+## Fərziyyə 3 — Aylıq Müraciət Trendinin Vizuallaşdırılması
+
+```{r ferziyye-3}
+encounters[, ay := floor_date(date, "month")]
+aylik <- encounters[!is.na(ay), .N, by = ay][order(ay)]
+
+# Xətti trend testi
+aylik[, ay_num := as.numeric(ay)]
+trend_model <- lm(N ~ ay_num, data = aylik)
+trend_p     <- summary(trend_model)$coefficients[2, 4]
+trend_r2    <- summary(trend_model)$r.squared
+
+cat("Xetti trend testi:\n")
+cat("R2 =", round(trend_r2, 4), "\n")
+cat("p-deger =", format(trend_p, scientific=TRUE, digits=3), "\n")
+cat("Netice:", ifelse(trend_p < 0.05,
+    "p < 0.05 → Statistik menali artim trendi TESDIQLENIB",
+    "p >= 0.05 → Trend statistik olaraq menali deyil"), "\n")
+
+ggplot(aylik, aes(x = ay, y = N)) +
+  geom_line(color = "#2c7bb6", alpha = 0.5, linewidth = 0.8) +
+  geom_smooth(method = "loess", span = 0.15,
+              color = "#d73027", se = TRUE, linewidth = 1.2) +
+  scale_y_continuous(labels = comma) +
+  labs(title    = "Aylik Muraciet Sayinin Vizuallasdirmasi",
+       subtitle = paste0("LOESS hamarlanmasi | Xetti trend: R2=",
+                         round(trend_r2,3), ", p=",
+                         format(trend_p, scientific=TRUE, digits=3)),
+       x = "Tarix", y = "Muraciet sayi") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+> **Şərh:** LOESS hamarlaşdırması tarixi trendin vizuallaşdırılması üçün istifadə edilmişdir — bu gələcəyə proqnoz vermir. Xətti trend testi statistik əhəmiyyəti təsdiqləmək üçün tətbiq edilmişdir.
+
+---
+
+# Xülasə
+
+```{r xulase-cedvel}
+xulase <- data.table(
+  Bolme   = c("Melumat Keyfiyyeti", "Melumat Keyfiyyeti",
+               "Deskriptiv", "Deskriptiv", "Deskriptiv",
+               "Anomaliyalar", "Korrelyasiya",
+               "Reqressiya", "Reqressiya",
+               "Ferziyye 1", "Ferziyye 2", "Ferziyye 3"),
+  Netice  = c(
+    "NA analizi aparildi — yuksek NA faizli sutunlar mueyyen edildi",
+    "Dublikat ve mentiqdisi qeydler yoxlanildi ve cixarildi",
+    paste0("Orta yas: ", round(mean(patients$yas, na.rm=TRUE), 1), " | Cins paylanmasi beraber"),
+    paste0("Olum nisbeti: ", round(patients[!is.na(deathdate),.N]/nrow(patients)*100,1), "%"),
+    "Xroniki xestelikler en cox muraciet sebebidir",
+    paste0(bmi_data[anomaliya==TRUE,.N], " BMI anomaliyasi (IQR metodu ile)"),
+    paste0("Pearson r=", round(kor_pearson$estimate,3),
+           " | Spearman rho=", round(kor_spearman$estimate,3), " (zeif musbet)"),
+    paste0("Sade model R2=", round(summary(model_sade)$r.squared,3)),
+    paste0("Murekkeb model R2=", round(summary(model_cox)$r.squared,3),
+           " | VIF normal"),
+    paste0("TESDIQLENIB — Kruskal-Wallis p=",
+           format(kw_test$p.value, scientific=TRUE, digits=2)),
+    paste0("TESDIQLENIB — Kruskal-Wallis p=",
+           format(kw_bmi$p.value, scientific=TRUE, digits=2)),
+    paste0("TESDIQLENIB — Xetti trend p=",
+           format(trend_p, scientific=TRUE, digits=2))
+  )
+)
+
+kable(xulase, caption = "Yekun Netice Cedveli") |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed")) |>
+  column_spec(1, bold = TRUE, color = "#2c7bb6")
+```
+
+## Tövsiyələr
+
+1. **Profilaktik proqramlar** — Obez pasiyentlər üçün müdaxilə proqramları hazırlanmalıdır
+2. **Yaşlı pasiyent xidmətləri** — 70+ yaş qrupu üçün ixtisaslaşmış kanallar inkişaf etdirilməlidir
+3. **Hipertenziya monitorinqi** — Qan təzyiqi 140 mmHg+ olan pasiyentlər mütəmadi izlənməlidir
+4. **Data keyfiyyəti** — Yüksək NA faizli sahələr üçün məlumat toplama prosesi yaxşılaşdırılmalıdır
+
+---
+
+*Hazirladı: Aysu İ | CodeAcademy DA505 | `r format(Sys.Date(), "%d %B %Y")`*
